@@ -275,20 +275,32 @@ def skill_summary(path):
 
 
 def relative_link_errors(path):
-    """Broken relative links in SKILL.md (evidence the skill cites but lacks)."""
+    """Broken relative links in SKILL.md (evidence the skill cites but lacks).
+
+    Code fences are skipped: a call like `tools[name](**args)` is not a link,
+    and a verifier that reports it is the bug.
+    """
     missing = []
     try:
         text = (path / "SKILL.md").read_text(encoding="utf-8")
     except OSError:
         return ["SKILL.md is unreadable"]
-    for raw in LINK_RE.findall(text):
-        if raw.startswith(("http://", "https://", "mailto:", "data:", "#")):
+    in_fence = False
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
             continue
-        target = unquote(raw.split("#", 1)[0].split("?", 1)[0])
-        if not target or target.startswith("/") or target in ("link", "url", "path", "..."):
+        if in_fence:
             continue
-        if not (path / target).exists():
-            missing.append(raw)
+        for raw in LINK_RE.findall(line):
+            if raw.startswith(("http://", "https://", "mailto:", "data:", "#")):
+                continue
+            target = unquote(raw.split("#", 1)[0].split("?", 1)[0])
+            if not target or target.startswith("/") or target in ("link", "url", "path", "..."):
+                continue
+            if not (path / target).exists():
+                missing.append(raw)
     return missing
 
 
