@@ -78,16 +78,19 @@ A skill can be pinned from another repository and kept current by its commit:
 
 ```sh
 ./bin/skillz hire https://github.com/mattpocock/skills \
-  --path skills/engineering/code-review --license MIT
+  --path skills --all --exclude deprecated,in-progress,misc \
+  --license MIT --group mattpocock/skills
 ./bin/skillz sync --check
-./bin/skillz sync --update code-review
+./bin/skillz sync --update
 ```
 
-`hire` vendors the skill, copies the upstream `LICENSE`, and records the repo,
-commit, path and tree hash in `sources.lock.json`. `sync --check` does not change
-the canon; `sync --update` refreshes the copy and reseals it. Use `--replace` if
-the skill name already exists. If you intend to diverge, remove the source entry
-instead of updating.
+`--all` imports every skill under the path as one expert bundle; the group shares
+a pin, so `sync --check` resolves the repository once. Omit `--all` to hire one
+skill. `hire` copies the upstream `LICENSE` and records the repo, commit, path
+and tree hash in `sources.lock.json`. `sync --check` does not change the canon;
+`sync --update` refreshes the copies and reseals them. Use `--replace` if a skill
+name already exists. If you intend to diverge, remove the source entry instead of
+updating.
 
 ## Run the MCP server
 

@@ -194,24 +194,32 @@ def sync_status(force=False):
     now = time.time()
     if not force and _SYNC_CACHE["data"] is not None and now - _SYNC_CACHE["at"] < 30:
         return _SYNC_CACHE["data"]
+    sources = load_sources()
+    groups = {}
+    for sid, entry in sources.items():
+        groups.setdefault((entry.get("repo") or "", entry.get("ref") or "main"),
+                          []).append((sid, entry))
+    latest = {key: latest_commit(*key) for key in groups}
     rows = {}
-    for sid, entry in load_sources().items():
-        latest, error = latest_commit(entry.get("repo") or "", entry.get("ref") or "main")
-        pinned = entry.get("commit")
-        if not latest:
-            state = "unreachable"
-        elif latest == pinned:
-            state = "current"
-        else:
-            state = "drift"
-        rows[sid] = {
-            "state": state,
-            "pinned": pinned,
-            "latest": latest,
-            "repo": entry.get("repo"),
-            "skill": entry.get("skill"),
-            "error": error,
-        }
+    for key, items in groups.items():
+        newest, error = latest[key]
+        for sid, entry in items:
+            pinned = entry.get("commit")
+            if not newest:
+                state = "unreachable"
+            elif newest == pinned:
+                state = "current"
+            else:
+                state = "drift"
+            rows[sid] = {
+                "state": state,
+                "pinned": pinned,
+                "latest": newest,
+                "repo": entry.get("repo"),
+                "skill": entry.get("skill"),
+                "group": entry.get("group"),
+                "error": error,
+            }
     if not rows:
         overall = "empty"
     elif all(row["state"] == "current" for row in rows.values()):

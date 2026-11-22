@@ -285,7 +285,7 @@ def relative_link_errors(path):
         if raw.startswith(("http://", "https://", "mailto:", "data:", "#")):
             continue
         target = unquote(raw.split("#", 1)[0].split("?", 1)[0])
-        if not target or target.startswith("/"):
+        if not target or target.startswith("/") or target in ("link", "url", "path", "..."):
             continue
         if not (path / target).exists():
             missing.append(raw)
@@ -555,39 +555,70 @@ def cmd_adopt(args):
 def cmd_hire(args):
     repo = normalize_repo(args.repo)
     ref = args.ref or "main"
-    entry = {
+    if args.all and args.name:
+        die("--name cannot be combined with --all")
+    group = args.group or repo_slug(repo)
+    base = {
         "repo": repo,
         "ref": ref,
-        "path": args.path.strip("/"),
-        "skill": None,
         "commit": None,
         "license": args.license or "see upstream",
-        "tree_hash": None,
-        "hired_at": None,
-        "updated_at": None,
+        "hired_at": now_iso(),
+        "updated_at": now_iso(),
         "notes": args.note or "",
+        "group": group,
     }
-    cache, commit = checkout_source(entry)
-    src = cache / entry["path"]
-    if not (src / "SKILL.md").is_file():
-        die("no SKILL.md at %s in %s" % (entry["path"], repo))
-    fm = parse_frontmatter((src / "SKILL.md").read_text(encoding="utf-8"))
-    name = validate_name(args.name or fm.get("name") or Path(entry["path"]).name)
-    entry["skill"] = name
-    entry["commit"] = commit
-    source_id = "%s/%s" % (repo_slug(repo), name)
+    cache, commit = checkout_source(base)
+    base["commit"] = commit
+
+    if args.all:
+        root = cache / args.path.strip("/")
+        if not root.is_dir():
+            die("no directory at %s in %s" % (args.path, repo))
+        excludes = {part.strip() for part in (args.exclude or "").split(",") if part.strip()}
+        skill_dirs = []
+        for skill_md in sorted(root.rglob("SKILL.md")):
+            rel = skill_md.parent.relative_to(cache)
+            if any(part in excludes for part in rel.parts):
+                continue
+            skill_dirs.append(skill_md.parent)
+        if not skill_dirs:
+            die("no skills under %s in %s" % (args.path, repo))
+    else:
+        src = cache / args.path.strip("/")
+        if not (src / "SKILL.md").is_file():
+            die("no SKILL.md at %s in %s" % (args.path, repo))
+        skill_dirs = [src]
+
     data = load_sources()
-    if source_id in data["sources"] and not args.replace:
-        die("%s is already pinned (use --replace)" % source_id)
-    if (SKILLS / name).exists() and not args.replace:
-        die("%s already exists (use --replace)" % (SKILLS / name))
-    entry["tree_hash"] = copy_hired(entry, cache, replace=args.replace)
-    entry["hired_at"] = now_iso()
-    entry["updated_at"] = entry["hired_at"]
-    data["sources"][source_id] = entry
+    added, skipped = [], []
+    for src in skill_dirs:
+        fm = parse_frontmatter((src / "SKILL.md").read_text(encoding="utf-8"))
+        name = validate_name(args.name or fm.get("name") or src.name)
+        entry = dict(base)
+        entry["path"] = src.relative_to(cache).as_posix()
+        entry["skill"] = name
+        entry["tree_hash"] = None
+        source_id = "%s/%s" % (repo_slug(repo), name)
+        if source_id in data["sources"] and not args.replace:
+            skipped.append(name)
+            continue
+        if (SKILLS / name).exists() and not args.replace:
+            skipped.append(name)
+            continue
+        entry["tree_hash"] = copy_hired(entry, cache, replace=args.replace)
+        data["sources"][source_id] = entry
+        added.append(name)
+
     save_sources(data)
-    print("hired %s from %s at %s" % (name, repo, commit[:12]))
-    print("pinned as %s; run `skillz sync --check`" % source_id)
+    print("hired %d skill(s) from %s at %s (%s)" %
+          (len(added), repo, commit[:12], group))
+    if added:
+        print("  " + ", ".join(sorted(added)))
+    if skipped:
+        eprint("skillz: skipped %d existing skill(s); use --replace to refresh: %s" %
+               (len(skipped), ", ".join(sorted(skipped))))
+    print("run `skillz sync --check`")
     cmd_catalog(argparse.Namespace(stdout=False, quiet=True))
 
 
@@ -604,21 +635,44 @@ def cmd_sync(args):
               if not args.name or args.name in (sid, sources[sid].get("skill"))]
     if not wanted:
         die("no source matches %r" % args.name)
-    results = {}
+    groups = {}
     for sid in wanted:
-        results[sid] = check_source(sources[sid])
+        entry = sources[sid]
+        groups.setdefault((entry["repo"], entry.get("ref") or "main"), []).append(sid)
+    latest = {}
+    for repo, ref in groups:
+        latest[(repo, ref)] = latest_commit(repo, ref)
+
+    def result_for(sid):
+        entry = sources[sid]
+        newest, error = latest[(entry["repo"], entry.get("ref") or "main")]
+        pinned = entry.get("commit")
+        if not newest:
+            state = "unreachable"
+        elif newest == pinned:
+            state = "current"
+        else:
+            state = "drift"
+        return {"state": state, "pinned": pinned, "latest": newest,
+                "repo": entry.get("repo"), "skill": entry.get("skill"), "error": error}
+
+    results = {sid: result_for(sid) for sid in wanted}
     if args.update:
-        for sid in wanted:
-            result = results[sid]
-            if result["state"] == "current" and not args.force:
+        for key, sids in groups.items():
+            if all(results[sid]["state"] == "current" for sid in sids) and not args.force:
                 continue
-            entry = sources[sid]
-            cache, commit = checkout_source(entry)
-            entry["commit"] = commit
-            entry["tree_hash"] = copy_hired(entry, cache, replace=True)
-            entry["updated_at"] = now_iso()
-            results[sid] = check_source(entry)
-            print("updated %s -> %s" % (sid, commit[:12]))
+            repo, ref = key
+            cache, commit = checkout_source(sources[sids[0]])
+            for sid in sids:
+                entry = sources[sid]
+                if results[sid]["state"] != "current" or args.force:
+                    entry["commit"] = commit
+                    entry["tree_hash"] = copy_hired(entry, cache, replace=True)
+                    entry["updated_at"] = now_iso()
+            latest[key] = (commit, "")
+            for sid in sids:
+                results[sid] = result_for(sid)
+            print("updated %d skill(s) from %s -> %s" % (len(sids), repo, commit[:12]))
     save_sources(data)
     if not results:
         state = "empty"
@@ -883,14 +937,18 @@ def cmd_catalog(args):
                          (row["name"], desc, row["files"], row["external"], row["sealed"]))
     else:
         lines.append("_No active skills yet. Adopt one with `bin/skillz adopt <path>`._")
-    lines += ["", "## Hired sources (%d)" % len(sources), ""]
+    lines += ["", "## Hired sources (%d entries)" % len(sources), ""]
     if sources:
-        lines += ["| Source | Skill | Pinned | License |", "| --- | --- | --- | --- |"]
+        groups = {}
         for sid, entry in sorted(sources.items()):
-            lines.append("| `%s` | `%s` | `%s` | %s |" %
-                         (sid, entry.get("skill") or "—",
-                          (entry.get("commit") or "")[:12],
-                          entry.get("license") or "—"))
+            groups.setdefault(entry.get("group") or sid, []).append((sid, entry))
+        lines += ["| Source | Skills | Pinned | License |", "| --- | ---: | --- | --- |"]
+        for group, items in sorted(groups.items()):
+            commits = sorted({(entry.get("commit") or "")[:12] for _sid, entry in items})
+            pinned = commits[0] if len(commits) == 1 else "mixed"
+            lines.append("| `%s` | %d | `%s` | %s |" %
+                         (group, len(items), pinned,
+                          items[0][1].get("license") or "—"))
     else:
         lines.append("_No hired sources._")
     lines += ["", "## Apocrypha — archived (%d)" % len(archived), ""]
@@ -929,6 +987,7 @@ def cmd_catalog(args):
 def cmd_status(args):
     lock = load_lock()
     sources = load_sources()["sources"]
+    source_groups = {entry.get("group") or sid for sid, entry in sources.items()}
     sync = read_json(STATE / "sync.json", {}) or {}
     ops = {}
     for label in ("mcp", "alarm", "adhd", "ingress"):
@@ -940,6 +999,7 @@ def cmd_status(args):
         "archived": len(archived_entries()),
         "external": len(lock["entries"]),
         "sources": len(sources),
+        "source_groups": len(source_groups),
         "sync": sync.get("state") or ("empty" if not sources else "unchecked"),
         "cache_bytes": dir_bytes(CACHE),
         "state_bytes": dir_bytes(STATE),
@@ -951,7 +1011,8 @@ def cmd_status(args):
     print("root      %s" % data["root"])
     print("canon     %d active, %d archived, %d external source(s)" %
           (data["active"], data["archived"], data["external"]))
-    print("sources   %d hired, sync %s" % (data["sources"], data["sync"]))
+    print("sources   %d hired in %d group(s), sync %s" %
+          (data["sources"], data["source_groups"], data["sync"]))
     print("cache     %s (disposable)" % human_bytes(data["cache_bytes"]))
     print("state     %s (runtime)" % human_bytes(data["state_bytes"]))
     for label, row in ops.items():
@@ -1516,6 +1577,9 @@ def build_parser():
     p = sub.add_parser("hire", help="pin a skill from another repository")
     p.add_argument("repo", help="owner/repo or an https URL")
     p.add_argument("--path", required=True, help="path to the skill directory in the repo")
+    p.add_argument("--all", action="store_true", help="import every skill under --path")
+    p.add_argument("--exclude", help="comma-separated path segments to skip (e.g. deprecated,in-progress)")
+    p.add_argument("--group", help="expert bundle name (defaults to owner/repo)")
     p.add_argument("--name", help="canonical skill name (defaults to the upstream name)")
     p.add_argument("--ref", default="main", help="upstream branch or tag (default main)")
     p.add_argument("--license", help="license identifier recorded in the source ledger")

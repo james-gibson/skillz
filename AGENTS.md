@@ -59,7 +59,9 @@ only record of what was retired.
 
 A hired skill is canon with a cited source. Its pin lives in
 `sources.lock.json`; its `skill.json` carries the same repository, commit, path
-and license.
+and license. An expert is a group of hired skills: `hire --all` imports the set,
+and `sync --check` resolves the repository/ref once for the group. The router
+(`ask-matt` in the worked example) is a member, not a special case.
 
 - Run `./bin/skillz sync --check` before editing a hired skill.
 - `./bin/skillz sync --update <name>` replaces the vendored tree with the

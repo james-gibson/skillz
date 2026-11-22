@@ -77,6 +77,7 @@ A skill may be vendored from another repository and still be canon.
       "path": "skills/engineering/code-review",
       "skill": "code-review",
       "license": "MIT",
+      "group": "mattpocock/skills",
       "tree_hash": "sha256:...",
       "hired_at": "2026-11-22T...",
       "updated_at": "2026-11-22T..."
@@ -84,6 +85,12 @@ A skill may be vendored from another repository and still be canon.
   }
 }
 ```
+
+`hire --all --path <root>` imports every `SKILL.md` under the root, skips the
+`--exclude` path segments, and writes one entry per skill with a shared `group`.
+`sync --check` resolves each repository/ref once for the whole group. A group is
+an expert bundle; the router (`ask-matt` in the worked example) is a member, not
+a special case.
 
 The vendored `skill.json` carries the same repository, commit, path and license
 under `source`. `verify` requires the two records to agree and the vendored tree

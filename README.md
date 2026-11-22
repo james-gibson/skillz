@@ -90,15 +90,20 @@ the commit it came from stays recorded:
 
 ```sh
 ./bin/skillz hire https://github.com/mattpocock/skills \
-  --path skills/engineering/code-review --license MIT --note "two-axis code review"
+  --path skills --all --exclude deprecated,in-progress,misc \
+  --license MIT --group mattpocock/skills \
+  --note "Matt Pocock's engineering and productivity skills"
 ./bin/skillz sync --check
-./bin/skillz sync --update code-review
+./bin/skillz sync --update
 ```
 
-`hire` vendors the skill into `skills/<name>/`, copies the upstream `LICENSE`, writes
-`sources.lock.json` with the repo, ref, commit and tree hash, and records the commit in `skill.json`.
-`sync --check` resolves the exact branch or tag with `git ls-remote` and reports `current`, `drift`
-or `unreachable`; `sync --update` refreshes the vendored copy and reseals it. Local edits are
+`--all` imports every `SKILL.md` under the path (minus the excluded segments) as one expert bundle.
+`ask-matt` is the router; the rest of the set is what it routes to. Omit `--all` to hire one skill.
+
+`hire` vendors each skill into `skills/<name>/`, copies the upstream `LICENSE`, writes
+`sources.lock.json` with the repo, ref, commit, path and tree hash, and records the commit in
+`skill.json`. Every member shares a `group`, and `sync --check` resolves the repository/ref once for
+the whole group. `sync --update` refreshes the vendored copies and reseals them. Local edits are
 replaced by `--update`; fork deliberately, not by accident.
 
 The alarm watches the pin. The MCP server advertises the `sync` capability only while every source
