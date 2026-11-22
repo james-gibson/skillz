@@ -64,6 +64,27 @@ targets:
         - "initialize"
         - "skills/status"
 
+  - id: "skillz-sync"
+    enabled: true
+    protocol: "mcp"
+    name: "skillz upstream sync (pinned sources)"
+    endpoint: "http://127.0.0.1:@MCP_PORT@/mcp"
+    transport: "http"
+    expected:
+      healthy_status_codes: [200]
+      min_capabilities:
+        - "sync/current"
+    auth:
+      type: "none"
+    check:
+      interval: "15s"
+      timeout: "10s"
+      retries: 1
+      handshake_profile: "base"
+      required_methods:
+        - "initialize"
+        - "sync/status"
+
   - id: "wan-ingress"
     enabled: @INGRESS_ENABLED@
     protocol: "mcp"

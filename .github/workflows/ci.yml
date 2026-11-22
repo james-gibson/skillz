@@ -20,5 +20,7 @@ jobs:
         run: python3 -m py_compile bin/skillz server/skillz_mcp.py
       - name: Verify the canon
         run: ./bin/skillz verify
+      - name: Source ledger
+        run: ./bin/skillz sync --check
       - name: Lifecycle smoke
         run: ./tests/smoke.sh

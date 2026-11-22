@@ -420,6 +420,9 @@ cmd_doctor() {
   echo "== ingress forward =="
   exercise_ingress || failures=$((failures + 1))
   echo
+  echo "== upstream sync =="
+  "$BIN" sync --check --strict || failures=$((failures + 1))
+  echo
   echo "== alarm state =="
   local healthy=0 status=""
   for _ in $(seq 1 20); do

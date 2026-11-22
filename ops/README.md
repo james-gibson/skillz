@@ -9,7 +9,7 @@ author's lab can see whether it is answering.
 
 | File | Rendered to | Purpose |
 | --- | --- | --- |
-| `smoke-alarm.yaml.tmpl` | `state/ops/smoke-alarm.yaml` | Watches `skillz-mcp` (strict handshake, requires `skills/read`) and, when enabled, the WAN ingress. |
+| `smoke-alarm.yaml.tmpl` | `state/ops/smoke-alarm.yaml` | Watches `skillz-mcp` (requires `skills/read`), `skillz-sync` (requires `sync/current`) and, when enabled, the WAN ingress. |
 | `adhd.yaml.tmpl` | `state/ops/adhd.yaml` | A loopback adhd instance that polls the alarm and renders the light. |
 | `ingress-agreement.json.tmpl` | `state/ops/agreements.json` | The name `skillz` resolves to the local MCP border. |
 | `wan-ingress.json.tmpl` | `state/ops/wan-ingress.json` | Fail-closed ingress config: loopback bind, bearer token, signed border. |
@@ -26,13 +26,21 @@ ops/install.sh logs -f
 ops/install.sh down
 ```
 
-`doctor` runs four checks:
+`doctor` runs five checks:
 
 1. `skillz verify` — the canon is internally consistent.
-2. `skillz probe` — the MCP surface answers `initialize` and `skills/status`.
+2. `skillz probe` — the MCP surface answers `initialize`, `skills/status` and
+   `sync/status`.
 3. `skillz ingress-probe` — a request signed with the border key is accepted,
    and an unsigned request is refused.
-4. The alarm reports every enabled target `healthy`.
+4. `skillz sync --check --strict` — every hired source still matches its pin.
+5. The alarm reports every enabled target `healthy`.
+
+The `skillz-sync` target is the reason an upstream change is visible without
+looking for it: the server advertises the `sync` capability only while every pin
+is current, and the alarm requires `sync/current`. A new upstream commit removes
+the capability and turns that light yellow. `skillz sync --update` refreshes the
+vendored copy, reseals it, and restores the capability.
 
 ## Secrets
 

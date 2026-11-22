@@ -61,6 +61,44 @@ change deliberately, run `skillz seal <name>`, and do not silently overwrite
 either side. Untracked sources may be moved and linked back, which is the
 one-copy model used for the global skills.
 
+## Hired sources
+
+A skill may be vendored from another repository and still be canon.
+`sources.lock.json` is the pin ledger:
+
+```json
+{
+  "schema": 1,
+  "sources": {
+    "mattpocock/skills/code-review": {
+      "repo": "https://github.com/mattpocock/skills",
+      "ref": "main",
+      "commit": "abeeaf95660ba9e8b7c753eb38f441ca707a8823",
+      "path": "skills/engineering/code-review",
+      "skill": "code-review",
+      "license": "MIT",
+      "tree_hash": "sha256:...",
+      "hired_at": "2026-11-22T...",
+      "updated_at": "2026-11-22T..."
+    }
+  }
+}
+```
+
+The vendored `skill.json` carries the same repository, commit, path and license
+under `source`. `verify` requires the two records to agree and the vendored tree
+to match `tree_hash`.
+
+- `hire` copies the skill and the upstream root `LICENSE`.
+- `sync --check` resolves the exact branch or tag and compares the pin; it does
+  not change the canon. Results are written to `state/sync.json` (ignored).
+- `sync --update` replaces the vendored tree and reseals it. Local edits are
+  lost; if you intend to diverge, remove the source entry and treat the skill as
+  authored instead.
+- The MCP server advertises `sync` only while every pin is current. The optional
+  `skillz-sync` alarm target requires `sync/current`, so an upstream commit turns
+  the light yellow until the pin is updated.
+
 ## Archive
 
 `archive/<name>/<YYYY-MM-DD>/` holds the retired copy. `ARCHIVE.json` records:

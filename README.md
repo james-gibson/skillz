@@ -51,6 +51,9 @@ contract is in [`AGENTS.md`](AGENTS.md).
 | --- | --- | --- |
 | Inventory | `./bin/skillz inventory` | nothing; reports candidates, duplicates and drift |
 | Adopt | `./bin/skillz adopt <path>` | copies into `skills/`, writes `skill.json` |
+| Hire | `./bin/skillz hire <repo> --path <path>` | pins a skill from another repository |
+| Sync | `./bin/skillz sync --check` | reports upstream drift without changing the canon |
+| Update | `./bin/skillz sync --update` | refreshes a drifted pin and reseals |
 | Seal | `./bin/skillz seal <name>` | re-hashes after an intentional edit |
 | Verify | `./bin/skillz verify` | checks frontmatter, hashes, links and citations |
 | Link | `./bin/skillz link` | symlinks the canon into an agent surface |
@@ -80,6 +83,28 @@ A skill may depend on something it did not write. Record it so the dependency is
 `external.lock.json` records origin, SHA-256, size, license, which skills use it, and whether the
 bytes are **owned** (`external/`, committed) or **referenced** (`cache/external/`, rebuildable).
 
+## Hiring an expert
+
+A skill can be pinned from another repository without losing its source. The skill becomes canon;
+the commit it came from stays recorded:
+
+```sh
+./bin/skillz hire https://github.com/mattpocock/skills \
+  --path skills/engineering/code-review --license MIT --note "two-axis code review"
+./bin/skillz sync --check
+./bin/skillz sync --update code-review
+```
+
+`hire` vendors the skill into `skills/<name>/`, copies the upstream `LICENSE`, writes
+`sources.lock.json` with the repo, ref, commit and tree hash, and records the commit in `skill.json`.
+`sync --check` resolves the exact branch or tag with `git ls-remote` and reports `current`, `drift`
+or `unreachable`; `sync --update` refreshes the vendored copy and reseals it. Local edits are
+replaced by `--update`; fork deliberately, not by accident.
+
+The alarm watches the pin. The MCP server advertises the `sync` capability only while every source
+is current, and the optional `skillz-sync` target requires `sync/current`. A new upstream commit
+removes the capability and turns that light yellow until the pin is updated.
+
 ## The MCP surface
 
 `./bin/skillz serve` exposes a **read-only** JSON-RPC surface on loopback:
@@ -91,6 +116,7 @@ bytes are **owned** (`external/`, committed) or **referenced** (`cache/external/
 | `skills/list` | active or archived skills with descriptions and hashes |
 | `skills/read` | one skill's `SKILL.md`, file list and provenance |
 | `skills/search` | a substring search across the active and archived tiers |
+| `sync/status` | pinned sources and whether any has drifted |
 | `tools/list`, `tools/call` | the same operations as MCP tools |
 
 Default bind: `127.0.0.1:8090`. The server refuses a non-loopback bind unless
@@ -139,6 +165,7 @@ skillz/
 ├── archive/                  retired skills, append-only
 ├── external/                 owned external payloads
 ├── external.lock.json        citation ledger
+├── sources.lock.json         hired-repository pins
 ├── cache/                    disposable (gitignored)
 ├── state/                    runtime, logs and secrets (gitignored)
 ├── ops/                      optional lab integration

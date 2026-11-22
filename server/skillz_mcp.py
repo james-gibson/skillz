@@ -22,6 +22,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,8 +33,9 @@ SKILLS = ROOT / "skills"
 ARCHIVE = ROOT / "archive"
 CACHE = ROOT / "cache"
 LOCK = ROOT / "external.lock.json"
+SOURCES = ROOT / "sources.lock.json"
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PROTOCOL_VERSION = "2025-06-18"
 MAX_BODY = 1 << 20
 MAX_SKEW = 300
@@ -158,6 +160,75 @@ def skill_record(path, tier="active"):
     }
 
 
+def load_sources():
+    data = read_json(SOURCES, {"schema": 1, "sources": {}}) or {}
+    sources = data.get("sources")
+    return sources if isinstance(sources, dict) else {}
+
+
+def latest_commit(repo, ref):
+    ref = (ref or "main").strip()
+    candidates = [ref] if ref.startswith("refs/") else ["refs/heads/" + ref, "refs/tags/" + ref]
+    error = ""
+    for candidate in candidates:
+        try:
+            proc = subprocess.run(["git", "ls-remote", repo, candidate],
+                                  capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            error = str(exc)
+            continue
+        if proc.returncode != 0:
+            error = proc.stderr.strip()
+            continue
+        for line in proc.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == candidate:
+                return parts[0], ""
+    return None, error or ("ref %s not found" % ref)
+
+
+_SYNC_CACHE = {"at": 0.0, "data": None}
+
+
+def sync_status(force=False):
+    now = time.time()
+    if not force and _SYNC_CACHE["data"] is not None and now - _SYNC_CACHE["at"] < 30:
+        return _SYNC_CACHE["data"]
+    rows = {}
+    for sid, entry in load_sources().items():
+        latest, error = latest_commit(entry.get("repo") or "", entry.get("ref") or "main")
+        pinned = entry.get("commit")
+        if not latest:
+            state = "unreachable"
+        elif latest == pinned:
+            state = "current"
+        else:
+            state = "drift"
+        rows[sid] = {
+            "state": state,
+            "pinned": pinned,
+            "latest": latest,
+            "repo": entry.get("repo"),
+            "skill": entry.get("skill"),
+            "error": error,
+        }
+    if not rows:
+        overall = "empty"
+    elif all(row["state"] == "current" for row in rows.values()):
+        overall = "current"
+    elif any(row["state"] == "unreachable" for row in rows.values()):
+        overall = "unreachable"
+    else:
+        overall = "drift"
+    data = {
+        "state": overall,
+        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "sources": rows,
+    }
+    _SYNC_CACHE.update({"at": now, "data": data})
+    return data
+
+
 def status_payload():
     cache_bytes = 0
     if CACHE.is_dir():
@@ -168,11 +239,14 @@ def status_payload():
             except OSError:
                 pass
     lock = read_json(LOCK, {"entries": {}}) or {"entries": {}}
+    sync = sync_status()
     return {
         "ready": SKILLS.is_dir(),
         "active": len(active_dirs()),
         "archived": len(archive_entries()),
         "external": len(lock.get("entries") or {}),
+        "sources": len(sync.get("sources") or {}),
+        "sync": sync.get("state"),
         "cache_bytes": cache_bytes,
         "tiers": {"canon": "skills/", "apocrypha": "archive/",
                   "sources": "external/ + external.lock.json", "ephemera": "cache/"},
@@ -272,6 +346,13 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}},
                         "required": ["query"]},
     },
+    {
+        "name": "sync_status",
+        "description": "Pinned upstream sources and whether they have drifted.",
+        "inputSchema": {"type": "object", "properties": {
+            "refresh": {"type": "boolean", "default": False}
+        }},
+    },
 ]
 
 
@@ -288,16 +369,23 @@ def call_tool(name, arguments):
         return record
     if name == "skills_search":
         return {"hits": search_skills(arguments.get("query") or "")}
+    if name == "sync_status":
+        return sync_status(force=bool(arguments.get("refresh")))
     raise RPCError(-32602, "unknown tool")
 
 
 def initialize_result():
+    sync = sync_status()
+    capabilities = {
+        "skills": {"read": True, "list": True, "search": True, "status": True},
+        "tools": {},
+    }
+    if sync["state"] in ("current", "empty"):
+        capabilities["sync"] = {"current": True,
+                                "sources": len(sync.get("sources") or {})}
     return {
         "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": {
-            "skills": {"read": True, "list": True, "search": True, "status": True},
-            "tools": {},
-        },
+        "capabilities": capabilities,
         "serverInfo": {"name": "skillz", "version": VERSION},
     }
 
@@ -326,6 +414,8 @@ def dispatch(payload):
             return ok(initialize_result())
         if method == "skills/status":
             return ok(status_payload())
+        if method == "sync/status":
+            return ok(sync_status(force=bool(params.get("refresh"))))
         if method == "skills/list":
             tier = params.get("tier") or "active"
             if tier not in ("active", "archive", "all"):

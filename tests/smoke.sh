@@ -7,7 +7,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 cp -R "$ROOT/bin" "$ROOT/skills" "$ROOT/archive" "$ROOT/external" "$ROOT/cache" "$ROOT/state" "$TMP/"
-cp "$ROOT/external.lock.json" "$TMP/"
+cp "$ROOT/external.lock.json" "$ROOT/sources.lock.json" "$TMP/"
 
 mkdir -p "$TMP/fixture-skill"
 cat > "$TMP/fixture-skill/SKILL.md" <<'EOF'
@@ -22,6 +22,9 @@ This file exists only for the lifecycle test.
 EOF
 
 cd "$TMP"
+
+echo "== source ledger =="
+./bin/skillz sync --check
 
 echo "== adopt =="
 ./bin/skillz adopt "$TMP/fixture-skill" --name fixture-skill

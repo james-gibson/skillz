@@ -55,6 +55,21 @@ Do not edit `archive/` in place. To change a retired skill, restore it, edit it,
 seal it, and archive it again. The archive is history; rewriting it destroys the
 only record of what was retired.
 
+## Hired skills
+
+A hired skill is canon with a cited source. Its pin lives in
+`sources.lock.json`; its `skill.json` carries the same repository, commit, path
+and license.
+
+- Run `./bin/skillz sync --check` before editing a hired skill.
+- `./bin/skillz sync --update <name>` replaces the vendored tree with the
+  upstream commit and reseals it. Local edits are lost; do not use it on a
+  deliberate fork.
+- To fork a hired skill, remove its entry from `sources.lock.json` and treat the
+  copy as authored; record why in the commit.
+- The optional `skillz-sync` alarm target requires `sync/current`. A drift is a
+  yellow light, not a suggestion to hand-edit the pin.
+
 ## External files
 
 - Record every non-trivial external dependency with `skillz external add`.

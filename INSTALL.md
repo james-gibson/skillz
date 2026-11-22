@@ -72,6 +72,23 @@ A link is a view. The canon remains in this repository; deleting the link does n
 If an upstream installer later recreates the directory, `./bin/skillz inventory` reports the drift;
 `link --force` re-asserts the view after you confirm the installer's copy is not newer.
 
+## Hire an external skill
+
+A skill can be pinned from another repository and kept current by its commit:
+
+```sh
+./bin/skillz hire https://github.com/mattpocock/skills \
+  --path skills/engineering/code-review --license MIT
+./bin/skillz sync --check
+./bin/skillz sync --update code-review
+```
+
+`hire` vendors the skill, copies the upstream `LICENSE`, and records the repo,
+commit, path and tree hash in `sources.lock.json`. `sync --check` does not change
+the canon; `sync --update` refreshes the copy and reseals it. Use `--replace` if
+the skill name already exists. If you intend to diverge, remove the source entry
+instead of updating.
+
 ## Run the MCP server
 
 ```sh

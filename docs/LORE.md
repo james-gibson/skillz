@@ -39,6 +39,11 @@ in `external/`; re-fetchable or large ones are materialised in the cache.
 A source is **not** canon. It is evidence the canon cites. If it drifts, that is
 a fact to check, not a reason to rewrite the skill silently.
 
+A **hired skill** is the exception that proves the rule: the skill itself is
+canon, and its repository, commit and license travel with it in
+`sources.lock.json`. The alarm watches the pin, so an upstream change is visible
+without a silent edit.
+
 ## Ephemera — `cache/`
 
 Downloads, fetched sources, previews, indexes, adoption backups. Disposable by
