@@ -90,7 +90,9 @@ A skill may be vendored from another repository and still be canon.
 `--exclude` path segments, and writes one entry per skill with a shared `group`.
 `sync --check` resolves each repository/ref once for the whole group. A group is
 an expert bundle; the router (`ask-matt` in the worked example) is a member, not
-a special case.
+a special case. `group` is a label, not a person: it can name an individual, a
+team, a framework, or a monorepo path. The ledger records the source and the
+license; it does not assume the author is an individual.
 
 The vendored `skill.json` carries the same repository, commit, path and license
 under `source`. `verify` requires the two records to agree and the vendored tree

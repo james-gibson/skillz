@@ -106,6 +106,14 @@ the commit it came from stays recorded:
 the whole group. `sync --update` refreshes the vendored copies and reseals them. Local edits are
 replaced by `--update`; fork deliberately, not by accident.
 
+A source does not have to be a person. The official shadcn/ui skill is one directory in a framework
+monorepo, pinned the same way:
+
+```sh
+./bin/skillz hire https://github.com/shadcn-ui/ui \
+  --path skills/shadcn --license MIT --group shadcn-ui/ui
+```
+
 The alarm watches the pin. The MCP server advertises the `sync` capability only while every source
 is current, and the optional `skillz-sync` target requires `sync/current`. A new upstream commit
 removes the capability and turns that light yellow until the pin is updated.
