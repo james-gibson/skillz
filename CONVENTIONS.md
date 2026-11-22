@@ -108,6 +108,21 @@ to match `tree_hash`.
   `skillz-sync` alarm target requires `sync/current`, so an upstream commit turns
   the light yellow until the pin is updated.
 
+## Authored adapters
+
+Not every source ships a `SKILL.md`. A library can be documented by an **authored
+adapter**:
+
+- copy no upstream text wholesale; write the skill for the library;
+- record the repository, commit, path and license in `skill.json.source`;
+- cite a pinned README or doc in `external.lock.json` with
+  `--retention referenced --fetch`, so `verify` can check the hash;
+- do not add a `sources.lock.json` entry: there is no upstream skill to sync,
+  and the adapter belongs to this repository, not to the upstream.
+
+GlassCN UI is the worked example. If the upstream documentation changes, re-read
+it and re-seal the adapter; there is no `sync --update` for an authored skill.
+
 ## Archive
 
 `archive/<name>/<YYYY-MM-DD>/` holds the retired copy. `ARCHIVE.json` records:

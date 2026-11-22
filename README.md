@@ -114,6 +114,11 @@ monorepo, pinned the same way:
   --path skills/shadcn --license MIT --group shadcn-ui/ui
 ```
 
+Not every library ships a `SKILL.md`. GlassCN UI is a component library, not an agent skill; its
+skill is an **authored adapter**. It copies no upstream skill, records the upstream commit in
+`skill.json`, and cites the README at that commit in `external.lock.json`. Use the same pattern for a
+framework that documents itself but has no agent entry point.
+
 The alarm watches the pin. The MCP server advertises the `sync` capability only while every source
 is current, and the optional `skillz-sync` target requires `sync/current`. A new upstream commit
 removes the capability and turns that light yellow until the pin is updated.
