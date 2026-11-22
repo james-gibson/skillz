@@ -99,6 +99,8 @@ the commit it came from stays recorded:
 
 `--all` imports every `SKILL.md` under the path (minus the excluded segments) as one expert bundle.
 `ask-matt` is the router; the rest of the set is what it routes to. Omit `--all` to hire one skill.
+A curated subset works the same way: run `hire` once per path with the same `--group`; only those
+skills are vendored, and the group still shares one pin.
 
 `hire` vendors each skill into `skills/<name>/`, copies the upstream `LICENSE`, writes
 `sources.lock.json` with the repo, ref, commit, path and tree hash, and records the commit in
