@@ -1,0 +1,16 @@
+# Disposable tiers
+cache/*
+!cache/README.md
+state/*
+!state/README.md
+
+# Python / editors / macOS
+__pycache__/
+*.py[cod]
+.DS_Store
+*.log
+*.part
+
+# Environment files
+.env
+.env.*

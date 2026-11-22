@@ -1,0 +1,1339 @@
+#!/usr/bin/env python3
+"""skillz — canonical owner of this machine's skills.
+
+Four tiers:
+  skills/    active canon, tracked
+  archive/   retired skills, tracked and append-only
+  external/  owned external payloads + external.lock.json citations
+  cache/     disposable, ignored
+
+The wire is read-only (server/skillz_mcp.py). This CLI owns mutation.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urlparse
+from urllib.request import Request, urlopen
+
+ROOT = Path(__file__).resolve().parent.parent
+SKILLS = ROOT / "skills"
+ARCHIVE = ROOT / "archive"
+EXTERNAL = ROOT / "external"
+CACHE = ROOT / "cache"
+STATE = ROOT / "state"
+LOCK = ROOT / "external.lock.json"
+CATALOG = ROOT / "CATALOG.md"
+
+SCHEMA = 1
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+JUNK_PARTS = {".git", "__pycache__", ".pytest_cache", ".DS_Store"}
+JUNK_SUFFIXES = {".pyc", ".pyo"}
+MAX_ADOPT_BYTES = 100 * 1024 * 1024
+MAX_FETCH_BYTES = 200 * 1024 * 1024
+LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+DEFAULT_AGENT_DIR = Path.home() / ".agents" / "skills"
+
+
+# ---------------------------------------------------------------- small helpers
+
+
+def eprint(*args):
+    print(*args, file=sys.stderr)
+
+
+def die(message, code=1):
+    eprint("skillz: %s" % message)
+    sys.exit(code)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def today():
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError as exc:
+        die("%s is not valid JSON: %s" % (path, exc))
+
+
+def write_json(path, data, mode=None):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def validate_name(name):
+    if not NAME_RE.match(name or ""):
+        die("invalid skill name %r (lowercase a-z0-9._- only)" % (name,))
+    return name
+
+
+def human_bytes(n):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+
+
+def dir_bytes(path):
+    total = 0
+    if not path.exists():
+        return 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def process_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def read_pid(path):
+    try:
+        return int(Path(path).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+# ------------------------------------------------------------- skill structure
+
+
+def parse_frontmatter(text):
+    """A deliberately small parser for the SKILL.md header.
+
+    Handles `key: value`, quoted values, and folded/literal blocks. That is all
+    the contract needs; a full YAML dependency would be a larger surface than
+    the file format.
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    try:
+        end = lines.index("---", 1)
+    except ValueError:
+        return {}
+    block = lines[1:end]
+    data = {}
+    i = 0
+    while i < len(block):
+        line = block[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+        if ":" not in line or line.startswith((" ", "\t")):
+            i += 1
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if value in (">", ">-", ">+", "|", "|-", "|+"):
+            folded = value.startswith(">")
+            buf = []
+            i += 1
+            while i < len(block) and (block[i].startswith(" ") or block[i].startswith("\t")):
+                buf.append(block[i].strip())
+                i += 1
+            data[key] = (" " if folded else "\n").join(buf).strip()
+            continue
+        if value[:1] in ("'", '"') and not (len(value) >= 2 and value[-1] == value[0]):
+            quote = value[0]
+            buf = [value[1:]]
+            i += 1
+            while i < len(block) and block[i].startswith((" ", "\t")):
+                nxt = block[i].strip()
+                if nxt.endswith(quote):
+                    buf.append(nxt[:-1])
+                    i += 1
+                    break
+                buf.append(nxt)
+                i += 1
+            data[key] = " ".join(buf).strip()
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        data[key] = value
+        i += 1
+    return data
+
+
+def tree_files(root, extra_exclude=()):
+    """Map relpath -> sha256 for every regular file, excluding manifests/junk."""
+    root = Path(root)
+    excluded = {"skill.json"}
+    excluded.update(extra_exclude)
+    out = {}
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root)
+        if any(part in JUNK_PARTS for part in rel.parts):
+            continue
+        if rel.as_posix() in excluded:
+            continue
+        if path.suffix in JUNK_SUFFIXES:
+            continue
+        if not path.is_file():
+            continue
+        out[rel.as_posix()] = sha256_file(path)
+    return out
+
+
+def tree_hash(files):
+    h = hashlib.sha256()
+    for rel in sorted(files):
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        h.update(bytes.fromhex(files[rel]))
+        h.update(b"\n")
+    return "sha256:" + h.hexdigest()
+
+
+def active_skills():
+    if not SKILLS.is_dir():
+        return []
+    return sorted(p for p in SKILLS.iterdir() if p.is_dir() and (p / "SKILL.md").is_file())
+
+
+def archived_entries(name=None):
+    out = []
+    if not ARCHIVE.is_dir():
+        return out
+    for skill_dir in sorted(ARCHIVE.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        if name and skill_dir.name != name:
+            continue
+        for date_dir in sorted(skill_dir.iterdir()):
+            if date_dir.is_dir() and (date_dir / "SKILL.md").is_file():
+                out.append((skill_dir.name, date_dir.name, date_dir))
+    return out
+
+
+def skill_summary(path):
+    try:
+        text = (path / "SKILL.md").read_text(encoding="utf-8")
+    except OSError:
+        return {"name": path.name, "description": ""}
+    fm = parse_frontmatter(text)
+    return {"name": fm.get("name") or path.name, "description": fm.get("description") or ""}
+
+
+def relative_link_errors(path):
+    """Broken relative links in SKILL.md (evidence the skill cites but lacks)."""
+    missing = []
+    try:
+        text = (path / "SKILL.md").read_text(encoding="utf-8")
+    except OSError:
+        return ["SKILL.md is unreadable"]
+    for raw in LINK_RE.findall(text):
+        if raw.startswith(("http://", "https://", "mailto:", "data:", "#")):
+            continue
+        target = unquote(raw.split("#", 1)[0].split("?", 1)[0])
+        if not target or target.startswith("/"):
+            continue
+        if not (path / target).exists():
+            missing.append(raw)
+    return missing
+
+
+def load_lock():
+    data = read_json(LOCK, {"schema": SCHEMA, "entries": {}})
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+        die("%s must contain {schema, entries}" % LOCK)
+    return data
+
+
+def save_lock(data):
+    data["schema"] = SCHEMA
+    write_json(LOCK, data)
+
+
+# ---------------------------------------------------------------------- init
+
+
+def cmd_init(args):
+    for path in (SKILLS, ARCHIVE, EXTERNAL, CACHE / "external", STATE / "ops", STATE / "logs"):
+        path.mkdir(parents=True, exist_ok=True)
+    if not LOCK.exists():
+        save_lock({"schema": SCHEMA, "entries": {}})
+    for name, body in (
+        (CACHE / "README.md", "# cache\n\nDisposable. `skillz gc` may empty this tier.\n"),
+        (STATE / "README.md", "# state\n\nRuntime pids, ports, generated configs and logs. Gitignored.\n"),
+    ):
+        if not name.exists():
+            name.write_text(body, encoding="utf-8")
+    print("initialised %s" % ROOT)
+
+
+# --------------------------------------------------------------------- adopt
+
+
+def cmd_adopt(args):
+    source = Path(args.path).expanduser()
+    if not source.exists() and not source.is_symlink():
+        die("source does not exist: %s" % source)
+    source_resolved = source.resolve()
+    if not source_resolved.is_dir() or not (source_resolved / "SKILL.md").is_file():
+        die("source is not a skill directory (no SKILL.md): %s" % source)
+
+    total = dir_bytes(source_resolved)
+    if total > MAX_ADOPT_BYTES and not args.allow_large:
+        die("source is %s; pass --allow-large to adopt it" % human_bytes(total))
+
+    fm = parse_frontmatter((source_resolved / "SKILL.md").read_text(encoding="utf-8"))
+    name = validate_name(args.name or fm.get("name") or source_resolved.name)
+    if fm.get("name") and fm["name"] != name:
+        die("SKILL.md declares name %r but adoption name is %r" % (fm["name"], name))
+
+    dest = SKILLS / name
+    if dest.exists():
+        if not args.replace:
+            die("%s already exists (use --replace to move the old copy to cache/)" % dest)
+        backup = CACHE / "adopt-backup" / ("%s-%d" % (name, int(time.time())))
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(dest), str(backup))
+        eprint("skillz: previous copy moved to %s" % backup.relative_to(ROOT))
+
+    SKILLS.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(
+        str(source_resolved),
+        str(dest),
+        ignore=shutil.ignore_patterns(".git", "__pycache__", ".DS_Store", "*.pyc", "*.pyo"),
+    )
+
+    files = tree_files(dest)
+    source_type = "path"
+    if args.source:
+        loc = args.source
+        source_type = "url" if loc.startswith(("http://", "https://")) else ("git" if loc.endswith(".git") else "path")
+    else:
+        loc = str(source).replace(str(Path.home()), "~")
+    manifest = {
+        "schema": SCHEMA,
+        "name": name,
+        "description": fm.get("description") or "",
+        "tier": "active",
+        "adopted_at": now_iso(),
+        "sealed_at": now_iso(),
+        "source": {
+            "type": source_type,
+            "location": loc,
+            "ref": args.ref,
+            "license": args.license,
+        },
+        "tags": args.tag or [],
+        "tree_hash": tree_hash(files),
+        "files": files,
+        "external": [],
+    }
+    write_json(dest / "skill.json", manifest)
+
+    moved = args.move or args.link
+    if moved:
+        if source.is_symlink():
+            source.unlink()
+        elif source_resolved != dest:
+            shutil.rmtree(str(source_resolved))
+        if args.link:
+            source.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(str(dest), str(source))
+            eprint("skillz: linked %s -> %s" % (source, dest.relative_to(ROOT)))
+        else:
+            eprint("skillz: source removed after move: %s" % source)
+
+    missing = relative_link_errors(dest)
+    for raw in missing:
+        eprint("skillz: warning: SKILL.md links to missing %s" % raw)
+
+    print("adopted %s (%d files, %s)" % (name, len(files), human_bytes(total)))
+    if args.replace:
+        eprint("skillz: old copy retained in cache/adopt-backup/")
+    cmd_catalog(argparse.Namespace(stdout=False, quiet=True))
+
+
+# ---------------------------------------------------------------------- seal
+
+
+def cmd_seal(args):
+    dest = SKILLS / validate_name(args.name)
+    if not dest.is_dir() or not (dest / "SKILL.md").is_file():
+        die("no active skill named %s" % args.name)
+    manifest = read_json(dest / "skill.json", {}) or {}
+    fm = parse_frontmatter((dest / "SKILL.md").read_text(encoding="utf-8"))
+    if fm.get("name") and fm["name"] != dest.name:
+        die("SKILL.md name %r does not match directory %r" % (fm["name"], dest.name))
+    files = tree_files(dest)
+    manifest.update(
+        {
+            "schema": SCHEMA,
+            "name": dest.name,
+            "description": fm.get("description") or manifest.get("description") or "",
+            "tier": "active",
+            "sealed_at": now_iso(),
+            "tree_hash": tree_hash(files),
+            "files": files,
+        }
+    )
+    manifest.setdefault("adopted_at", now_iso())
+    manifest.setdefault("source", {"type": "authored", "location": None, "ref": None, "license": None})
+    manifest.setdefault("tags", [])
+    manifest.setdefault("external", [])
+    write_json(dest / "skill.json", manifest)
+    print("sealed %s (%s)" % (dest.name, manifest["tree_hash"][:19] + "..."))
+    cmd_catalog(argparse.Namespace(stdout=False, quiet=True))
+
+
+# -------------------------------------------------------------------- verify
+
+
+def verify_active():
+    errors, warnings = [], []
+    for path in active_skills():
+        name = path.name
+        fm = parse_frontmatter((path / "SKILL.md").read_text(encoding="utf-8"))
+        if not fm.get("name"):
+            errors.append("%s: SKILL.md has no frontmatter name" % name)
+        elif fm["name"] != name:
+            errors.append("%s: SKILL.md name %r does not match directory" % (name, fm["name"]))
+        manifest = read_json(path / "skill.json")
+        if not manifest:
+            errors.append("%s: missing skill.json (run skillz seal %s)" % (name, name))
+        else:
+            files = tree_files(path)
+            actual = tree_hash(files)
+            if manifest.get("tree_hash") != actual:
+                errors.append("%s: tree hash mismatch (run skillz seal %s)" % (name, name))
+            if manifest.get("files") != files:
+                changed = sorted(set(files) ^ set(manifest.get("files") or {}))
+                if changed:
+                    errors.append("%s: file set differs from manifest: %s" % (name, ", ".join(changed[:5])))
+            for ext_id in manifest.get("external") or []:
+                if ext_id not in load_lock()["entries"]:
+                    errors.append("%s: external id %r is not in external.lock.json" % (name, ext_id))
+        for raw in relative_link_errors(path):
+            warnings.append("%s: SKILL.md links to missing %s" % (name, raw))
+    return errors, warnings
+
+
+def verify_archive():
+    errors, warnings = [], []
+    for name, date, path in archived_entries():
+        manifest = read_json(path / "ARCHIVE.json")
+        if not manifest:
+            errors.append("archive/%s/%s: missing ARCHIVE.json" % (name, date))
+            continue
+        files = tree_files(path, extra_exclude=("ARCHIVE.json",))
+        actual = tree_hash(files)
+        if manifest.get("tree_hash") != actual:
+            errors.append("archive/%s/%s: tree hash mismatch" % (name, date))
+        fm = parse_frontmatter((path / "SKILL.md").read_text(encoding="utf-8"))
+        if fm.get("name") and fm["name"] != name:
+            warnings.append("archive/%s/%s: SKILL.md name %r differs" % (name, date, fm["name"]))
+    return errors, warnings
+
+
+def verify_external():
+    errors, warnings = [], []
+    data = load_lock()
+    active_names = {p.name for p in active_skills()}
+    archived_names = {n for n, _d, _p in archived_entries()}
+    known = active_names | archived_names
+    for ext_id, entry in sorted(data["entries"].items()):
+        for user in entry.get("used_by") or []:
+            if user not in known:
+                warnings.append("external/%s: used_by %r is not an active or archived skill" % (ext_id, user))
+        storage = entry.get("storage")
+        if storage:
+            stored = ROOT / storage
+            if not stored.exists():
+                if entry.get("retention") == "owned":
+                    errors.append("external/%s: owned payload missing at %s" % (ext_id, storage))
+                else:
+                    warnings.append("external/%s: not cached at %s (run skillz external fetch)" % (ext_id, storage))
+                continue
+            want = entry.get("sha256")
+            if want and sha256_file(stored) != want:
+                errors.append("external/%s: payload hash mismatch at %s" % (ext_id, storage))
+        else:
+            kind = entry.get("kind")
+            loc = entry.get("location") or ""
+            if kind == "path":
+                p = Path(loc).expanduser()
+                if not p.exists():
+                    if entry.get("retention") == "owned":
+                        errors.append("external/%s: owned source missing at %s" % (ext_id, loc))
+                    else:
+                        warnings.append("external/%s: referenced path missing at %s" % (ext_id, loc))
+                elif entry.get("sha256") and p.is_file() and sha256_file(p) != entry["sha256"]:
+                    errors.append("external/%s: referenced file hash mismatch at %s" % (ext_id, loc))
+            elif kind == "url" and not storage:
+                warnings.append("external/%s: URL recorded but not fetched (run skillz external fetch)" % ext_id)
+    return errors, warnings
+
+
+def cmd_verify(args):
+    errors, warnings = [], []
+    for fn in (verify_active, verify_archive, verify_external):
+        e, w = fn()
+        errors.extend(e)
+        warnings.extend(w)
+    active = len(active_skills())
+    archived = len(archived_entries())
+    if args.json:
+        print(json.dumps({"ok": not errors, "active": active, "archived": archived,
+                          "errors": errors, "warnings": warnings}, indent=2))
+    else:
+        for item in errors:
+            print("ERROR   %s" % item)
+        for item in warnings:
+            print("warning %s" % item)
+        print("%d active, %d archived, %d error(s), %d warning(s)" %
+              (active, archived, len(errors), len(warnings)))
+    sys.exit(1 if errors else 0)
+
+
+# ---------------------------------------------------------------------- list
+
+
+def cmd_list(args):
+    rows = []
+    if args.tier in ("active", "all"):
+        for path in active_skills():
+            s = skill_summary(path)
+            manifest = read_json(path / "skill.json", {}) or {}
+            rows.append({"tier": "active", "name": path.name, "description": s["description"],
+                         "date": (manifest.get("sealed_at") or "")[:10],
+                         "external": len(manifest.get("external") or [])})
+    if args.tier in ("archive", "all"):
+        for name, date, path in archived_entries():
+            manifest = read_json(path / "ARCHIVE.json", {}) or {}
+            s = skill_summary(path)
+            rows.append({"tier": "archive", "name": name, "description": s["description"],
+                         "date": date, "external": 0, "reason": manifest.get("reason") or ""})
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("no skills")
+        return
+    for row in rows:
+        desc = (row.get("description") or "").replace("\n", " ")
+        if len(desc) > 90:
+            desc = desc[:87] + "..."
+        extra = (" [%s]" % row["reason"]) if row.get("reason") else ""
+        print("%-7s %-28s %-10s %s%s" % (row["tier"], row["name"], row.get("date") or "", desc, extra))
+
+
+# -------------------------------------------------------------------- catalog
+
+
+def cmd_catalog(args):
+    active = []
+    for path in active_skills():
+        s = skill_summary(path)
+        manifest = read_json(path / "skill.json", {}) or {}
+        files = manifest.get("files") or {}
+        active.append({
+            "name": path.name,
+            "description": s["description"],
+            "files": len(files),
+            "external": len(manifest.get("external") or []),
+            "sealed": (manifest.get("sealed_at") or "")[:10],
+            "hash": (manifest.get("tree_hash") or "")[:15],
+        })
+    archived = []
+    for name, date, path in archived_entries():
+        manifest = read_json(path / "ARCHIVE.json", {}) or {}
+        archived.append({"name": name, "date": date,
+                         "reason": manifest.get("reason") or "",
+                         "hash": (manifest.get("tree_hash") or "")[:15]})
+    lock = load_lock()
+    lines = [
+        "# Catalog",
+        "",
+        "_Generated by `bin/skillz catalog` at %s. Do not edit by hand._" % now_iso(),
+        "",
+        "## Canon — active (%d)" % len(active),
+        "",
+    ]
+    if active:
+        lines += ["| Skill | What it is for | Files | External | Sealed |", "| --- | --- | ---: | ---: | --- |"]
+        for row in active:
+            desc = row["description"].replace("|", "\\|").replace("\n", " ")
+            if len(desc) > 110:
+                desc = desc[:107] + "..."
+            lines.append("| `%s` | %s | %d | %d | %s |" %
+                         (row["name"], desc, row["files"], row["external"], row["sealed"]))
+    else:
+        lines.append("_No active skills yet. Adopt one with `bin/skillz adopt <path>`._")
+    lines += ["", "## Apocrypha — archived (%d)" % len(archived), ""]
+    if archived:
+        lines += ["| Skill | Date | Why it was retired | Hash |", "| --- | --- | --- | --- |"]
+        for row in archived:
+            reason = (row["reason"] or "").replace("|", "\\|")
+            lines.append("| `%s` | %s | %s | `%s` |" % (row["name"], row["date"], reason, row["hash"]))
+    else:
+        lines.append("_Nothing archived._")
+    lines += ["", "## Sources — external ledger (%d)" % len(lock["entries"]), ""]
+    if lock["entries"]:
+        lines += ["| ID | Retention | Used by | License | SHA-256 |", "| --- | --- | --- | --- | --- |"]
+        for ext_id, entry in sorted(lock["entries"].items()):
+            users = ", ".join(entry.get("used_by") or []) or "—"
+            sha = (entry.get("sha256") or "")[:15]
+            lines.append("| `%s` | %s | %s | %s | `%s` |" %
+                         (ext_id, entry.get("retention") or "referenced", users,
+                          entry.get("license") or "—", sha))
+    else:
+        lines.append("_No external sources recorded._")
+    lines.append("")
+    text = "\n".join(lines)
+    if args.stdout:
+        print(text)
+        return
+    CATALOG.write_text(text, encoding="utf-8")
+    if not getattr(args, "quiet", False):
+        print("wrote %s (%d active, %d archived, %d sources)" %
+              (CATALOG.relative_to(ROOT), len(active), len(archived), len(lock["entries"])))
+
+
+# --------------------------------------------------------------------- status
+
+
+def cmd_status(args):
+    lock = load_lock()
+    ops = {}
+    for label in ("mcp", "alarm", "adhd", "ingress"):
+        pid = read_pid(STATE / "ops" / ("%s.pid" % label))
+        ops[label] = {"pid": pid, "alive": process_alive(pid)}
+    data = {
+        "root": str(ROOT),
+        "active": len(active_skills()),
+        "archived": len(archived_entries()),
+        "external": len(lock["entries"]),
+        "cache_bytes": dir_bytes(CACHE),
+        "state_bytes": dir_bytes(STATE),
+        "ops": ops,
+    }
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+    print("root      %s" % data["root"])
+    print("canon     %d active, %d archived, %d external source(s)" %
+          (data["active"], data["archived"], data["external"]))
+    print("cache     %s (disposable)" % human_bytes(data["cache_bytes"]))
+    print("state     %s (runtime)" % human_bytes(data["state_bytes"]))
+    for label, row in ops.items():
+        state = ("running pid %d" % row["pid"]) if row["alive"] else "stopped"
+        print("%-9s %s" % (label + ":", state))
+
+
+# --------------------------------------------------------------------- search
+
+
+def cmd_search(args):
+    query = args.query.lower()
+    hits = []
+
+    def scan(tier, path):
+        try:
+            text = (path / "SKILL.md").read_text(encoding="utf-8")
+        except OSError:
+            return
+        fm = parse_frontmatter(text)
+        haystacks = [("name", fm.get("name") or path.name),
+                     ("description", fm.get("description") or ""),
+                     ("body", text)]
+        for where, value in haystacks:
+            if query in value.lower():
+                line = ""
+                if where == "body":
+                    for candidate in text.splitlines():
+                        if query in candidate.lower():
+                            line = candidate.strip()
+                            break
+                else:
+                    line = value.replace("\n", " ")
+                hits.append({"tier": tier, "name": path.name, "where": where,
+                             "line": line[:160]})
+                return
+
+    for path in active_skills():
+        scan("active", path)
+    for _name, _date, path in archived_entries():
+        scan("archive", path)
+    if args.json:
+        print(json.dumps(hits, indent=2))
+        return
+    if not hits:
+        print("no matches for %r" % args.query)
+        return
+    for hit in hits:
+        print("%-7s %-28s %s" % (hit["tier"], hit["name"], hit["line"]))
+
+
+# --------------------------------------------------------------------- link
+
+
+def cmd_link(args):
+    into = Path(args.into).expanduser() if args.into else DEFAULT_AGENT_DIR
+    names = args.names or [p.name for p in active_skills()]
+    if args.unlink:
+        removed = 0
+        for name in names:
+            dest = into / validate_name(name)
+            if dest.is_symlink():
+                target = dest.resolve()
+                if str(target).startswith(str(SKILLS.resolve()) + os.sep):
+                    dest.unlink()
+                    removed += 1
+                    print("unlinked %s" % dest)
+                else:
+                    eprint("skillz: refusing to remove %s (points outside skills/)" % dest)
+        print("%d link(s) removed" % removed)
+        return
+    into.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        src = SKILLS / validate_name(name)
+        if not src.is_dir():
+            eprint("skillz: no active skill named %s" % name)
+            continue
+        dest = into / name
+        if dest.is_symlink():
+            target = dest.resolve()
+            if str(target).startswith(str(SKILLS.resolve()) + os.sep) or args.force:
+                dest.unlink()
+            else:
+                eprint("skillz: %s is a symlink outside skills/ (use --force)" % dest)
+                continue
+        elif dest.exists():
+            if not args.force:
+                eprint("skillz: %s exists and is not a symlink (use --force)" % dest)
+                continue
+            backup = CACHE / "link-backup" / ("%s-%d" % (name, int(time.time())))
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(dest), str(backup))
+            eprint("skillz: %s moved to %s" % (dest, backup.relative_to(ROOT)))
+        os.symlink(str(src), str(dest))
+        print("linked %s -> %s" % (dest, src.relative_to(ROOT)))
+
+
+# ------------------------------------------------------------------ inventory
+
+
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
+             "out", "coverage", "target", ".next", ".cache", "vendor"}
+
+
+def discover_skill_dirs(root, max_depth=8):
+    root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        return []
+    found = []
+    base_depth = len(root.parts)
+    for dirpath, dirnames, _filenames in os.walk(root):
+        depth = len(Path(dirpath).parts) - base_depth
+        if depth > max_depth:
+            dirnames[:] = []
+            continue
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        current = Path(dirpath)
+        if depth > 0 and (current / "SKILL.md").is_file():
+            found.append(current)
+            dirnames[:] = []
+            continue
+        if current.name == "skills":
+            for child in sorted(current.iterdir()):
+                if child.is_dir() and (child / "SKILL.md").is_file():
+                    found.append(child)
+            dirnames[:] = []
+    return found
+
+
+def inventory_status(path, name):
+    canonical = SKILLS / name
+    resolved = path.resolve()
+    if path.is_symlink() and str(resolved).startswith(str(SKILLS.resolve()) + os.sep):
+        return "linked"
+    if str(resolved).startswith(str(SKILLS.resolve()) + os.sep):
+        return "canonical"
+    if not canonical.is_dir():
+        return "candidate"
+    manifest = read_json(canonical / "skill.json", {}) or {}
+    theirs = tree_hash(tree_files(resolved))
+    return "duplicate" if manifest.get("tree_hash") == theirs else "drift"
+
+
+def cmd_inventory(args):
+    roots = [Path(r).expanduser() for r in (args.root or [])]
+    if not roots:
+        roots = [Path.home() / ".agents", Path.home() / ".claude", Path.home() / ".codex",
+                 Path.home() / ".cursor", Path.home() / ".config" / "opencode", Path.home() / "projects"]
+    seen = {}
+    for root in roots:
+        for path in discover_skill_dirs(root, max_depth=args.max_depth):
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            key = str(resolved)
+            if key in seen:
+                continue
+            fm = parse_frontmatter((path / "SKILL.md").read_text(encoding="utf-8"))
+            name = fm.get("name") or path.name
+            seen[key] = {
+                "name": name,
+                "path": str(path).replace(str(Path.home()), "~"),
+                "resolved": key,
+                "status": inventory_status(path, name),
+                "hash": tree_hash(tree_files(resolved))[:19],
+                "symlink": path.is_symlink(),
+            }
+    rows = sorted(seen.values(), key=lambda r: (r["status"], r["name"], r["path"]))
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("no skills found under %s" % ", ".join(str(r) for r in roots))
+        return
+    for row in rows:
+        mark = "->" if row["symlink"] else "  "
+        print("%-10s %-28s %s %s" % (row["status"], row["name"], mark, row["path"]))
+    counts = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    print("")
+    print("%d found: %s" % (len(rows), ", ".join("%s=%d" % (k, counts[k]) for k in sorted(counts))))
+
+
+# -------------------------------------------------------------------- archive
+
+
+def cmd_archive(args):
+    if args.list or not args.name:
+        entries = archived_entries()
+        if not entries:
+            print("nothing archived")
+            return
+        for name, date, path in entries:
+            manifest = read_json(path / "ARCHIVE.json", {}) or {}
+            print("%-28s %-10s %s" % (name, date, manifest.get("reason") or ""))
+        return
+    name = validate_name(args.name)
+    src = SKILLS / name
+    if not src.is_dir():
+        die("no active skill named %s" % name)
+    date = args.date or today()
+    dest_parent = ARCHIVE / name
+    dest = dest_parent / date
+    n = 2
+    while dest.exists():
+        dest = dest_parent / ("%s-%d" % (date, n))
+        n += 1
+    dest_parent.mkdir(parents=True, exist_ok=True)
+    files = tree_files(src)
+    manifest = read_json(src / "skill.json", {}) or {}
+    shutil.move(str(src), str(dest))
+    write_json(dest / "ARCHIVE.json", {
+        "schema": SCHEMA,
+        "name": name,
+        "tier": "archive",
+        "archived_at": now_iso(),
+        "date": dest.name,
+        "reason": args.reason or "",
+        "tree_hash": tree_hash(files),
+        "files": files,
+        "source": manifest.get("source") or {},
+    })
+    print("archived %s -> %s" % (name, dest.relative_to(ROOT)))
+    cmd_catalog(argparse.Namespace(stdout=False, quiet=True))
+
+
+def cmd_restore(args):
+    name = validate_name(args.name)
+    if (SKILLS / name).exists():
+        die("%s is already active" % name)
+    entries = [e for e in archived_entries(name) if not args.date or e[1] == args.date]
+    if not entries:
+        die("no archived copy of %s%s" % (name, (" dated " + args.date) if args.date else ""))
+    _n, _date, src = entries[-1]
+    dest = SKILLS / name
+    SKILLS.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dest))
+    try:
+        (dest / "ARCHIVE.json").unlink()
+    except FileNotFoundError:
+        pass
+    manifest = read_json(dest / "skill.json", {}) or {}
+    files = tree_files(dest)
+    manifest.update({"tier": "active", "sealed_at": now_iso(),
+                     "tree_hash": tree_hash(files), "files": files})
+    write_json(dest / "skill.json", manifest)
+    # Clean empty archive parents.
+    for parent in (src.parent, src.parent.parent):
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+    print("restored %s from %s" % (name, src.relative_to(ROOT)))
+    cmd_catalog(argparse.Namespace(stdout=False, quiet=True))
+
+
+# ------------------------------------------------------------------- external
+
+
+def http_get(url, dest, max_bytes=MAX_FETCH_BYTES):
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    req = Request(url, headers={"User-Agent": "skillz/1.0"})
+    try:
+        with urlopen(req, timeout=30) as response:
+            length = response.headers.get("Content-Length")
+            if length and int(length) > max_bytes:
+                die("remote file is larger than %s" % human_bytes(max_bytes))
+            tmp = dest.with_name(dest.name + ".part")
+            total = 0
+            with open(tmp, "wb") as fh:
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        fh.close()
+                        tmp.unlink()
+                        die("remote file exceeded %s" % human_bytes(max_bytes))
+                    fh.write(chunk)
+            os.replace(tmp, dest)
+            return total
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        die("fetch failed for %s: %s" % (url, exc))
+
+
+def external_storage_path(entry, filename=None):
+    name = filename or Path(urlparse(entry["location"]).path).name or "payload"
+    if entry.get("retention") == "owned":
+        return EXTERNAL / entry["id"] / name
+    return CACHE / "external" / entry["id"] / name
+
+
+def cmd_external(args):
+    data = load_lock()
+    entries = data["entries"]
+
+    if args.action == "list":
+        if args.json:
+            print(json.dumps(entries, indent=2, sort_keys=True))
+            return
+        if not entries:
+            print("no external sources recorded")
+            return
+        for ext_id, entry in sorted(entries.items()):
+            print("%-28s %-10s %-10s %s" % (ext_id, entry.get("retention"),
+                                            ",".join(entry.get("used_by") or []) or "—",
+                                            entry.get("location")))
+        return
+
+    if args.action == "add":
+        if not args.id or not args.location:
+            die("external add requires <id> <location>")
+        ext_id = validate_name(args.id)
+        if ext_id in entries and not args.replace:
+            die("%s is already in external.lock.json (use --replace)" % ext_id)
+        loc = args.location
+        kind = args.kind or ("url" if loc.startswith(("http://", "https://")) else "path")
+        retention = args.retention
+        if kind == "url" and retention == "owned":
+            pass  # downloaded below
+        entry = {
+            "id": ext_id,
+            "location": loc,
+            "kind": kind,
+            "retention": retention,
+            "sha256": args.sha256,
+            "size": None,
+            "license": args.license,
+            "used_by": args.used_by or [],
+            "added_at": now_iso(),
+            "fetched_at": None,
+            "storage": None,
+        }
+        local = Path(loc).expanduser() if kind == "path" else None
+        if kind == "path" and args.sha256 is None and local and local.is_file():
+            entry["sha256"] = sha256_file(local)
+        if args.fetch:
+            if kind == "url":
+                dest = external_storage_path(entry)
+                size = http_get(loc, dest)
+                entry["storage"] = str(dest.relative_to(ROOT))
+                entry["size"] = size
+                entry["fetched_at"] = now_iso()
+                if args.sha256 is None:
+                    entry["sha256"] = sha256_file(dest)
+            elif local and local.is_file():
+                if retention == "owned":
+                    dest = external_storage_path(entry)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(local), str(dest))
+                    entry["storage"] = str(dest.relative_to(ROOT))
+                entry["size"] = local.stat().st_size
+                entry["fetched_at"] = now_iso()
+        entries[ext_id] = entry
+        save_lock(data)
+        print("recorded %s (%s, %s)" % (ext_id, kind, retention))
+        cmd_catalog(argparse.Namespace(stdout=False, quiet=True))
+        return
+
+    if args.action == "verify":
+        errors, warnings = verify_external()
+        for item in errors:
+            print("ERROR   %s" % item)
+        for item in warnings:
+            print("warning %s" % item)
+        print("%d external source(s), %d error(s), %d warning(s)" %
+              (len(entries), len(errors), len(warnings)))
+        sys.exit(1 if errors else 0)
+
+    if args.action == "fetch":
+        wanted = [args.id] if args.id else sorted(entries)
+        for ext_id in wanted:
+            entry = entries.get(ext_id)
+            if not entry:
+                eprint("skillz: no external source %s" % ext_id)
+                continue
+            if entry.get("kind") == "url":
+                dest = external_storage_path(entry)
+                size = http_get(entry["location"], dest)
+                entry["storage"] = str(dest.relative_to(ROOT))
+                entry["size"] = size
+                entry["fetched_at"] = now_iso()
+                if not entry.get("sha256"):
+                    entry["sha256"] = sha256_file(dest)
+                print("fetched %s -> %s" % (ext_id, entry["storage"]))
+            elif entry.get("retention") == "owned":
+                src = Path(entry["location"]).expanduser()
+                if not src.is_file():
+                    eprint("skillz: owned source missing for %s: %s" % (ext_id, src))
+                    continue
+                dest = external_storage_path(entry)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dest))
+                entry["storage"] = str(dest.relative_to(ROOT))
+                entry["size"] = dest.stat().st_size
+                entry["fetched_at"] = now_iso()
+                print("copied %s -> %s" % (ext_id, entry["storage"]))
+            else:
+                print("%s is referenced in place; nothing to fetch" % ext_id)
+        save_lock(data)
+        return
+
+    if args.action == "remove":
+        if not args.id:
+            die("external remove requires <id>")
+        ext_id = args.id
+        if ext_id not in entries:
+            die("no external source %s" % ext_id)
+        entry = entries.pop(ext_id)
+        if args.purge:
+            for path in (EXTERNAL / ext_id, CACHE / "external" / ext_id):
+                if path.exists():
+                    shutil.rmtree(str(path))
+        save_lock(data)
+        print("removed %s%s" % (ext_id, " and purged payloads" if args.purge else ""))
+        cmd_catalog(argparse.Namespace(stdout=False, quiet=True))
+        return
+
+    die("unknown external action")
+
+
+# ------------------------------------------------------------------------ gc
+
+
+def cmd_gc(args):
+    if not CACHE.exists():
+        print("cache is already empty")
+        return
+    total = 0
+    victims = []
+    for path in sorted(CACHE.rglob("*"), reverse=True):
+        if path.name in ("README.md", ".gitkeep"):
+            continue
+        if path.is_file():
+            try:
+                total += path.stat().st_size
+                victims.append(path)
+            except OSError:
+                pass
+    if args.dry_run:
+        print("would free %s in %d file(s)" % (human_bytes(total), len(victims)))
+        return
+    for path in victims:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    for path in sorted([p for p in CACHE.rglob("*") if p.is_dir()], reverse=True):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+    (CACHE / "external").mkdir(parents=True, exist_ok=True)
+    print("freed %s" % human_bytes(total))
+
+
+# --------------------------------------------------------------------- serve
+
+
+def cmd_serve(args):
+    server = ROOT / "server" / "skillz_mcp.py"
+    cmd = [sys.executable, str(server), "--port", str(args.port), "--host", args.host]
+    if args.border_key_file:
+        cmd += ["--border-key-file", str(Path(args.border_key_file).expanduser())]
+    if args.namespace:
+        cmd += ["--namespace", args.namespace]
+    if args.allow_non_loopback:
+        cmd += ["--allow-non-loopback"]
+    os.execv(sys.executable, cmd)
+
+
+# --------------------------------------------------------------------- probes
+
+
+def rpc_post(url, payload, headers=None, timeout=5):
+    if isinstance(payload, (bytes, bytearray)):
+        data = bytes(payload)
+    else:
+        data = json.dumps(payload).encode("utf-8")
+    req = Request(url, data=data, method="POST",
+                  headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with urlopen(req, timeout=timeout) as response:
+            return response.status, response.read().decode("utf-8", "replace")
+    except HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")
+    except (URLError, OSError) as exc:
+        return 0, str(exc)
+
+
+def cmd_probe(args):
+    url = args.url or "http://127.0.0.1:%d/mcp" % args.port
+    ok = True
+    for method, params in (("initialize", {}), ("skills/status", {})):
+        status, body = rpc_post(url, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+        print("%-16s HTTP %s %s" % (method, status, body[:300].replace("\n", " ")))
+        ok = ok and status == 200 and '"result"' in body
+    sys.exit(0 if ok else 1)
+
+
+def cmd_ingress_probe(args):
+    key_file = Path(args.key_file).expanduser()
+    key = os.environ.get("SKILLZ_BORDER_KEY") or ""
+    if not key and key_file.exists():
+        key = key_file.read_text(encoding="utf-8").strip()
+    if not key:
+        die("no border key (set SKILLZ_BORDER_KEY or create %s)" % key_file)
+    namespace = args.namespace
+    path = "/namespace/%s/name/skills" % namespace
+    url = (args.url or "http://127.0.0.1:%d" % args.port) + path
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "skills/status", "params": {}}).encode("utf-8")
+    ts = str(int(time.time()))
+    digest = sha256_bytes(body)
+    import hmac as _hmac
+    mac = _hmac.new(key.encode("utf-8"), digestmod=hashlib.sha256)
+    mac.update(("POST\n%s\n%s\n%s\n%s" % (path, namespace, digest, ts)).encode("utf-8"))
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "X-Lab-Signature": mac.hexdigest(),
+        "X-Lab-Namespace": namespace,
+        "X-Lab-Timestamp": ts,
+    }
+    status, reply = rpc_post(url, body, headers=headers)
+    print("signed   HTTP %s %s" % (status, reply[:300].replace("\n", " ")))
+    signed_ok = status == 200 and '"result"' in reply
+
+    bad_status, bad_reply = rpc_post(url, body)
+    print("unsigned HTTP %s %s" % (bad_status, bad_reply[:160].replace("\n", " ")))
+    rejected = bad_status in (401, 403, 503)
+    print("border   %s" % ("PASS" if signed_ok and rejected else "FAIL"))
+    sys.exit(0 if (signed_ok and rejected) else 1)
+
+
+# ---------------------------------------------------------------------- main
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="skillz", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("init", help="create/repair the tier directories")
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("adopt", help="bring a skill into the canon")
+    p.add_argument("path")
+    p.add_argument("--name")
+    p.add_argument("--replace", action="store_true")
+    p.add_argument("--move", action="store_true", help="remove the source after copying")
+    p.add_argument("--link", action="store_true", help="replace the source with a symlink (implies --move)")
+    p.add_argument("--source", help="provenance URL/path (defaults to the adopted path)")
+    p.add_argument("--ref")
+    p.add_argument("--license")
+    p.add_argument("--tag", action="append")
+    p.add_argument("--allow-large", action="store_true")
+    p.set_defaults(func=cmd_adopt)
+
+    p = sub.add_parser("seal", help="re-hash an intentionally edited skill")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_seal)
+
+    p = sub.add_parser("verify", help="check frontmatter, hashes, links and citations")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("list", help="list active and archived skills")
+    p.add_argument("--tier", choices=("active", "archive", "all"), default="all")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("catalog", help="regenerate CATALOG.md")
+    p.add_argument("--stdout", action="store_true")
+    p.set_defaults(func=cmd_catalog)
+
+    p = sub.add_parser("status", help="counts, tier sizes and ops pids")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("search", help="search active and archived skills")
+    p.add_argument("query")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("link", help="link active skills into an agent skills directory")
+    p.add_argument("names", nargs="*")
+    p.add_argument("--into", help="destination (default ~/.agents/skills)")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--unlink", action="store_true")
+    p.set_defaults(func=cmd_link)
+
+    p = sub.add_parser("inventory", help="find skills already on the machine")
+    p.add_argument("--root", action="append", help="root to scan (repeatable)")
+    p.add_argument("--max-depth", type=int, default=8)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_inventory)
+
+    p = sub.add_parser("archive", help="retire a skill (or list the archive)")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--reason")
+    p.add_argument("--date")
+    p.add_argument("--list", action="store_true")
+    p.set_defaults(func=cmd_archive)
+
+    p = sub.add_parser("restore", help="restore an archived skill")
+    p.add_argument("name")
+    p.add_argument("--date")
+    p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser("external", help="manage the external-source ledger")
+    p.add_argument("action", choices=("add", "list", "verify", "fetch", "remove"))
+    p.add_argument("id", nargs="?")
+    p.add_argument("location", nargs="?")
+    p.add_argument("--kind", choices=("url", "path"))
+    p.add_argument("--retention", choices=("owned", "referenced"), default="referenced")
+    p.add_argument("--used-by", action="append")
+    p.add_argument("--license")
+    p.add_argument("--sha256")
+    p.add_argument("--fetch", action="store_true")
+    p.add_argument("--replace", action="store_true")
+    p.add_argument("--purge", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_external)
+
+    p = sub.add_parser("gc", help="empty the disposable cache")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_gc)
+
+    p = sub.add_parser("serve", help="run the read-only MCP server")
+    p.add_argument("--port", type=int, default=8090)
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--border-key-file")
+    p.add_argument("--namespace", default="skillz")
+    p.add_argument("--allow-non-loopback", action="store_true")
+    p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("probe", help="probe a running MCP surface")
+    p.add_argument("--url")
+    p.add_argument("--port", type=int, default=8090)
+    p.set_defaults(func=cmd_probe)
+
+    p = sub.add_parser("ingress-probe", help="sign and send a wan-ingress border request")
+    p.add_argument("--url")
+    p.add_argument("--port", type=int, default=8090)
+    p.add_argument("--namespace", default="skillz")
+    p.add_argument("--key-file", default=str(STATE / "ops" / "border.key"))
+    p.set_defaults(func=cmd_ingress_probe)
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    ROOT.mkdir(parents=True, exist_ok=True)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+{
+  "adopted_at": "2026-11-22T04:46:31Z",
+  "description": "A minimal skill used to verify a skillz installation. Use when testing adopt, seal, verify, link, archive or the MCP read path before adding a real skill.",
+  "external": [],
+  "files": {
+    "SKILL.md": "bb9acf58db01fe44c91d45d4e41203d1566ccd6e18a0824a64211fb1380f15a5"
+  },
+  "name": "example-skill",
+  "schema": 1,
+  "sealed_at": "2026-11-22T04:46:31Z",
+  "source": {
+    "license": null,
+    "location": null,
+    "ref": null,
+    "type": "authored"
+  },
+  "tags": [],
+  "tier": "active",
+  "tree_hash": "sha256:1efb47fc64c998875bf79e51ea668ede73cabd885a4b8e9cd500683753d1205a"
+}
